@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(systemctl:*)",
+      "Bash(gphoto2:*)",
+      "Bash(kill:*)",
+      "Bash(lsof:*)",
+      "Bash(lsusb:*)",
+      "Bash(sudo:*)",
+      "Bash(source:*)",
+      "Bash(conda activate:*)",
+      "Bash(timeout:*)",
+      "Bash(python:*)",
+      "Bash(/home/zichen/.local/share/mamba/envs/rmyolo/bin/python:*)"
+    ]
+  }
+}
