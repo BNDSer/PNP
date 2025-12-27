@@ -323,9 +323,12 @@ def main():
     print("=" * 60)
 
     # Simplify模式开关（默认关闭）
-    # True: 使用简化PNP（z轴向上，xy轴右手系）
+    # True: 使用简化PNP（取绝对值避免多解）
     # False: 使用标准OpenCV PNP（可能有多个解）
-    USE_SIMPLIFY_PNP = False
+    USE_SIMPLIFY_PNP = True
+
+    # PNP解算超时阈值（毫秒），超过此时间的帧将跳过PNP解算
+    PNP_TIMEOUT_MS = 50
 
     # 打开摄像头
     camera_index = 2
@@ -409,6 +412,9 @@ def main():
             is_big = is_big_armor(armor_kpts)
             object_points = ARMOR_BIG if is_big else ARMOR_SMALL
 
+            # 记录PNP解算开始时间
+            pnp_start_time = cv2.getTickCount()
+
             # 标准OpenCV PNP解算
             success, rvec, tvec = cv2.solvePnP(
                 object_points, armor_kpts,
@@ -416,7 +422,11 @@ def main():
                 flags=cv2.SOLVEPNP_IPPE
             )
 
-            if success:
+            # 计算PNP解算耗时（毫秒）
+            pnp_time = (cv2.getTickCount() - pnp_start_time) * 1000 / cv2.getTickFrequency()
+
+            if success and pnp_time < PNP_TIMEOUT_MS:
+                # PNP解算成功且未超时
                 # 获取位置向量
                 position = tvec.flatten()
 
@@ -439,6 +449,14 @@ def main():
                 # 显示坐标
                 pos_text = f"({position[0]:.0f}, {position[1]:.0f}, {position[2]:.0f})"
                 cv2.putText(frame, pos_text, tuple(pts[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            elif pnp_time >= PNP_TIMEOUT_MS:
+                # PNP解算超时，跳过位姿解算，只保留矩形框
+                print(f"装甲板: PNP解算超时 ({pnp_time:.1f}ms > {PNP_TIMEOUT_MS}ms)，跳过位姿解算")
+                # 在矩形框旁显示超时标记
+                cv2.putText(frame, 'TIMEOUT', tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+            else:
+                # PNP解算失败
+                print(f"装甲板: PNP解算失败")
 
         # 显示检测信息
         mode_text = '[SIMPLIFY]' if USE_SIMPLIFY_PNP else '[STANDARD]'
