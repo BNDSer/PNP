@@ -31,6 +31,11 @@ ARMOR_BIG = np.array([
     [112.5, -27.5, 0]    # 右上
 ], dtype=np.float64)
 
+# Simplify模式开关（默认开启）
+# True: 简化模式，始终认为装甲板面朝相机，灯条正立
+# False: 标准模式，保持原始检测值
+USE_SIMPLIFY_PNP = True
+
 
 def load_camera_calibration(calibration_file='calibration_data.npz'):
     """
@@ -82,6 +87,10 @@ class Light:
             ellipse = cv2.fitEllipse(contour)
             rect = cv2.minAreaRect(contour)
             self.top, self.bottom = self._get_points_by_ellipse(ellipse, rect)
+
+        # SIMPLIFY模式：确保灯条倒立（top的y坐标始终大于bottom的y坐标，即top在bottom之下）
+        if USE_SIMPLIFY_PNP and self.top[1] < self.bottom[1]:
+            self.top, self.bottom = self.bottom, self.top
 
         self.center = (self.top + self.bottom) / 2.0
         self.length = np.linalg.norm(self.bottom - self.top)
@@ -258,7 +267,7 @@ def get_matched_armors(lights):
             if np.abs(angle) > np.deg2rad(60):
                 continue
 
-            # 合格的装甲板
+            # 生成装甲板角点
             armor_kpts = np.array([
                 lights[i].top,
                 lights[i].bottom,
@@ -266,9 +275,48 @@ def get_matched_armors(lights):
                 lights[j].top
             ], dtype=np.float32)
 
+            # 检测矩形框是否交叉，如果交叉则修正
+            armor_kpts = fix_crossed_armor(armor_kpts, lights[i], lights[j])
+
             armors.append(armor_kpts)
 
     return armors
+
+
+def fix_crossed_armor(kpts, light1, light2):
+    """检测并修正交叉的装甲板角点
+
+    检测四边形是否自相交，如果相交则交换一个灯条的top和bottom
+    """
+    # 检测线段是否交叉：(0,1)与(2,3)或(1,2)与(3,0)
+    if lines_intersect(kpts[0], kpts[1], kpts[2], kpts[3]) or \
+       lines_intersect(kpts[1], kpts[2], kpts[3], kpts[0]):
+
+        # 尝试交换第二个灯条的top和bottom
+        kpts_fixed = np.array([
+            light1.top,
+            light1.bottom,
+            light2.top,
+            light2.bottom
+        ], dtype=np.float32)
+
+        # 检查修正后是否仍然交叉
+        if not (lines_intersect(kpts_fixed[0], kpts_fixed[1], kpts_fixed[2], kpts_fixed[3]) or \
+               lines_intersect(kpts_fixed[1], kpts_fixed[2], kpts_fixed[3], kpts_fixed[0])):
+            return kpts_fixed
+
+    return kpts
+
+
+def lines_intersect(p1, p2, p3, p4):
+    """检测两条线段是否相交
+
+    使用向量叉积方法检测线段(p1,p2)和(p3,p4)是否相交
+    """
+    def ccw(A, B, C):
+        return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+
+    return (ccw(p1, p3, p4) != ccw(p2, p3, p4)) and (ccw(p1, p2, p3) != ccw(p1, p2, p4))
 
 
 def is_big_armor(kpts):
@@ -321,11 +369,6 @@ def main():
     print("=" * 60)
     print("装甲板识别与6D位姿解算程序")
     print("=" * 60)
-
-    # Simplify模式开关（默认关闭）
-    # True: 使用简化PNP（取绝对值避免多解）
-    # False: 使用标准OpenCV PNP（可能有多个解）
-    USE_SIMPLIFY_PNP = True
 
     # PNP解算超时阈值（毫秒），超过此时间的帧将跳过PNP解算
     PNP_TIMEOUT_MS = 50
