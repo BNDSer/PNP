@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 import sys
 import os
+from collections import deque
+from copy import deepcopy
 
 # 装甲板实际尺寸（单位：mm）
 '''ARMOR_SMALL = np.array([
@@ -35,6 +37,191 @@ ARMOR_BIG = np.array([
 # True: 简化模式，始终认为装甲板面朝相机，灯条正立
 # False: 标准模式，保持原始检测值
 USE_SIMPLIFY_PNP = True
+
+# 历史帧最大保存数量
+MAX_HISTORY_FRAMES = 10
+
+
+class KalmanFilter:
+    """卡尔曼滤波器类，用于平滑装甲板的位姿估计"""
+    def __init__(self, process_noise=1e-3, measurement_noise=1e-1):
+        # 状态向量: [x, y, z, vx, vy, vz] (位置和速度)
+        self.state_dim = 6
+        self.measurement_dim = 3
+
+        # 初始化状态
+        self.state = np.zeros((self.state_dim, 1))
+        self.initialized = False
+
+        # 状态转移矩阵 (匀速模型)
+        self.F = np.eye(self.state_dim, dtype=np.float64)
+        dt = 1.0  # 假设时间步长为1
+        for i in range(3):
+            self.F[i, i+3] = dt
+
+        # 测量矩阵 (只观测位置)
+        self.H = np.zeros((self.measurement_dim, self.state_dim), dtype=np.float64)
+        self.H[0, 0] = 1  # x
+        self.H[1, 1] = 1  # y
+        self.H[2, 2] = 1  # z
+
+        # 过程噪声协方差
+        self.Q = process_noise * np.eye(self.state_dim, dtype=np.float64)
+
+        # 测量噪声协方差
+        self.R = measurement_noise * np.eye(self.measurement_dim, dtype=np.float64)
+
+        # 状态协方差
+        self.P = np.eye(self.state_dim, dtype=np.float64)
+
+    def predict(self):
+        """预测步骤"""
+        if not self.initialized:
+            return None
+
+        # 状态预测: x = F * x
+        self.state = self.F @ self.state
+
+        # 协方差预测: P = F * P * F^T + Q
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+        return self.state[:3].flatten()  # 返回预测位置
+
+    def update(self, measurement):
+        """更新步骤
+
+        Args:
+            measurement: 3D位置测量值 [x, y, z]
+        """
+        measurement = np.array(measurement).reshape(-1, 1)
+
+        if not self.initialized:
+            # 首次初始化
+            self.state[:3] = measurement
+            self.state[3:] = 0  # 初始速度设为0
+            self.initialized = True
+            return measurement.flatten()
+
+        # 计算卡尔曼增益: K = P * H^T * (H * P * H^T + R)^-1
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+
+        # 更新状态: x = x + K * (z - H * x)
+        innovation = measurement - self.H @ self.state
+        self.state = self.state + K @ innovation
+
+        # 更新协方差: P = (I - K * H) * P
+        I = np.eye(self.state_dim)
+        self.P = (I - K @ self.H) @ self.P
+
+        return self.state[:3].flatten()
+
+    def get_position(self):
+        """获取当前估计位置"""
+        if not self.initialized:
+            return None
+        return self.state[:3].flatten()
+
+
+class ArmorTracker:
+    """装甲板跟踪器，管理历史帧和卡尔曼滤波"""
+    def __init__(self, max_history=10):
+        self.max_history = max_history
+        self.reset()
+
+    def reset(self):
+        """重置跟踪器"""
+        self.kalman_filter = KalmanFilter()
+        self.history_frames = deque(maxlen=self.max_history)
+        self.no_detection_count = 0
+        self.last_valid_detection = None
+        self.last_valid_frame_image = None
+        self.last_valid_frame_data = None
+
+    def add_detection(self, position, rvec, tvec, armor_kpts, frame_image):
+        """添加新的检测结果
+
+        Args:
+            position: 3D位置
+            rvec: 旋转向量
+            tvec: 平移向量
+            armor_kpts: 装甲板关键点
+            frame_image: 帧图像（带绘制的检测结果）
+        """
+        # 使用卡尔曼滤波更新位置估计
+        filtered_position = self.kalman_filter.update(position)
+
+        # 保存检测结果和历史图像
+        self.last_valid_detection = {
+            'position': filtered_position,
+            'rvec': rvec.copy() if rvec is not None else None,
+            'tvec': tvec.copy() if tvec is not None else None,
+            'armor_kpts': armor_kpts.copy()
+        }
+
+        self.last_valid_frame_image = frame_image.copy()
+
+        # 保存历史帧数据
+        self.last_valid_frame_data = {
+            'position': filtered_position.copy(),
+            'rvec': rvec.copy() if rvec is not None else None,
+            'tvec': tvec.copy() if tvec is not None else None,
+            'armor_kpts': armor_kpts.copy(),
+            'frame_count': len(self.history_frames)
+        }
+
+        self.history_frames.append(self.last_valid_frame_data)
+
+        # 重置无检测计数器
+        self.no_detection_count = 0
+
+        return filtered_position
+
+    def predict(self):
+        """预测当前帧的位置
+
+        Returns:
+            (has_valid_data, data_dict)
+            has_valid_data: 是否有有效数据
+            data_dict: 包含position, rvec, tvec, armor_kpts, frame_image
+        """
+        # 卡尔曼滤波预测
+        predicted_position = self.kalman_filter.predict()
+
+        if predicted_position is None:
+            return False, None
+
+        # 检查是否超过最大无检测帧数
+        if self.no_detection_count >= self.max_history:
+            return False, None
+
+        # 增加无检测计数
+        self.no_detection_count += 1
+
+        # 使用上一次的有效检测结果
+        if self.last_valid_detection is None:
+            return False, None
+
+        # 返回带有预测位置的检测结果
+        result = {
+            'position': predicted_position,
+            'rvec': self.last_valid_detection['rvec'],
+            'tvec': self.last_valid_detection['tvec'],
+            'armor_kpts': self.last_valid_detection['armor_kpts'],
+            'frame_image': self.last_valid_frame_image.copy() if self.last_valid_frame_image is not None else None,
+            'is_predicted': True,
+            'no_detection_count': self.no_detection_count
+        }
+
+        return True, result
+
+    def get_filtered_position(self):
+        """获取当前滤波后的位置"""
+        return self.kalman_filter.get_position()
+
+    def has_valid_data(self):
+        """是否有有效的历史数据"""
+        return self.last_valid_detection is not None and self.no_detection_count < self.max_history
 
 
 def load_camera_calibration(calibration_file='calibration_data.npz'):
@@ -409,11 +596,15 @@ def main():
     print("\n操作说明:")
     print("  空格键: 暂停/继续")
     print("  S 键: 保存当前帧")
+    print("  R 键: 重置跟踪器")
     print("  ESC/Q: 退出")
     print("=" * 60)
 
     paused = False
     frame_count = 0
+
+    # 创建装甲板跟踪器
+    armor_tracker = ArmorTracker(max_history=MAX_HISTORY_FRAMES)
 
     while True:
         if not paused:
@@ -446,6 +637,8 @@ def main():
         armors = get_matched_armors(lights)
 
         # 5. 对每个装甲板进行PNP解算
+        detected_armor = False  # 标记当前帧是否检测到装甲板
+
         for armor_kpts in armors:
             # 绘制装甲板轮廓
             pts = armor_kpts.reshape(-1, 2).astype(int)
@@ -470,28 +663,43 @@ def main():
 
             if success and pnp_time < PNP_TIMEOUT_MS:
                 # PNP解算成功且未超时
+                detected_armor = True
+
                 # 获取位置向量
                 position = tvec.flatten()
 
                 if USE_SIMPLIFY_PNP:
                     # 简化模式：取绝对值，避免多解问题
                     position = np.abs(position)
-                    print(f"装甲板[SIMPLIFY]: 距离={np.linalg.norm(position):.1f}mm, 位置=({position[0]:.1f}, {position[1]:.1f}, {position[2]:.1f})")
-                else:
-                    # 标准模式：保持原始值
-                    print(f"装甲板[STANDARD]: 距离={np.linalg.norm(position):.1f}mm, 位置=({position[0]:.1f}, {position[1]:.1f}, {position[2]:.1f})")
+
+                # 使用卡尔曼滤波平滑位置估计
+                filtered_position = armor_tracker.add_detection(position, rvec, tvec, armor_kpts, frame)
+
+                # 打印信息（显示滤波后的结果）
+                mode_str = '[SIMPLIFY]' if USE_SIMPLIFY_PNP else '[STANDARD]'
+                print(f"装甲板{mode_str}[检测]: 距离={np.linalg.norm(filtered_position):.1f}mm, "
+                      f"原始=({position[0]:.1f}, {position[1]:.1f}, {position[2]:.1f}), "
+                      f"滤波=({filtered_position[0]:.1f}, {filtered_position[1]:.1f}, {filtered_position[2]:.1f})")
+
+                # 使用滤波后的位置进行显示
+                display_position = filtered_position
 
                 # 绘制3D坐标系
                 draw_coordinate_system(frame, armor_kpts, rvec, tvec, camera_matrix, dist_coeffs)
 
                 # 显示距离和位置信息
-                distance = np.linalg.norm(position)
+                distance = np.linalg.norm(display_position)
                 label = f"{distance:.0f}mm"
                 cv2.putText(frame, label, tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
                 # 显示坐标
-                pos_text = f"({position[0]:.0f}, {position[1]:.0f}, {position[2]:.0f})"
+                pos_text = f"({display_position[0]:.0f}, {display_position[1]:.0f}, {display_position[2]:.0f})"
                 cv2.putText(frame, pos_text, tuple(pts[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+                # 显示卡尔曼滤波标记
+                cv2.putText(frame, 'KF', tuple(pts[0] + np.array([0, 20])),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+
             elif pnp_time >= PNP_TIMEOUT_MS:
                 # PNP解算超时，跳过位姿解算，只保留矩形框
                 print(f"装甲板: PNP解算超时 ({pnp_time:.1f}ms > {PNP_TIMEOUT_MS}ms)，跳过位姿解算")
@@ -500,6 +708,52 @@ def main():
             else:
                 # PNP解算失败
                 print(f"装甲板: PNP解算失败")
+
+        # 6. 如果当前帧没有检测到装甲板，尝试使用历史帧数据和卡尔曼预测
+        if not detected_armor and armor_tracker.has_valid_data():
+            has_prediction, prediction_data = armor_tracker.predict()
+
+            if has_prediction and prediction_data is not None:
+                # 使用预测的历史数据
+                position = prediction_data['position']
+                no_detect_count = prediction_data['no_detection_count']
+                armor_kpts = prediction_data['armor_kpts']
+                rvec = prediction_data['rvec']
+                tvec = prediction_data['tvec']
+
+                print(f"装甲板[预测-{no_detect_count}/{MAX_HISTORY_FRAMES}]: "
+                      f"距离={np.linalg.norm(position):.1f}mm, "
+                      f"位置=({position[0]:.1f}, {position[1]:.1f}, {position[2]:.1f})")
+
+                # 绘制装甲板轮廓（使用历史关键点）
+                if armor_kpts is not None:
+                    pts = armor_kpts.reshape(-1, 2).astype(int)
+                    # 使用虚线效果绘制预测的装甲板
+                    cv2.polylines(frame, [pts], True, (0, 165, 255), 2)
+
+                    # 绘制3D坐标系
+                    if rvec is not None and tvec is not None:
+                        draw_coordinate_system(frame, armor_kpts, rvec, tvec, camera_matrix, dist_coeffs)
+
+                        # 显示距离和位置信息
+                        distance = np.linalg.norm(position)
+                        label = f"P:{distance:.0f}mm"
+                        cv2.putText(frame, label, tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+
+                        # 显示坐标
+                        pos_text = f"({position[0]:.0f}, {position[1]:.0f}, {position[2]:.0f})"
+                        cv2.putText(frame, pos_text, tuple(pts[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+
+                # 在当前帧上显示预测信息
+                predict_text = f"PREDICTED ({no_detect_count}/{MAX_HISTORY_FRAMES})"
+                cv2.putText(frame, predict_text, (10, 95), cv2.FONT_HERSHEY_SIMPLEX,
+                           0.6, (0, 165, 255), 2)
+
+        # 如果连续多帧没有检测，显示警告
+        if not detected_armor and armor_tracker.no_detection_count >= MAX_HISTORY_FRAMES:
+            cv2.putText(frame, 'NO DETECTION - TRACKING LOST',
+                       (10, height - 30), cv2.FONT_HERSHEY_SIMPLEX,
+                       0.7, (0, 0, 255), 2)
 
         # 显示检测信息
         mode_text = '[SIMPLIFY]' if USE_SIMPLIFY_PNP else '[STANDARD]'
@@ -525,6 +779,9 @@ def main():
             filename = f'armor_detection_{frame_count}.jpg'
             cv2.imwrite(filename, frame)
             print(f"已保存: {filename}")
+        elif key == ord('r'):
+            armor_tracker.reset()
+            print("跟踪器已重置")
 
     # 释放资源
     cap.release()
